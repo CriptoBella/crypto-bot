@@ -1,693 +1,911 @@
-# -*- coding: utf-8 -*-
-# CryptoBella — 24/7 Signals Bot (CEX+DEX, scalp, EMA, arbitrage)
-# Sources: MEXC, KuCoin, Gate.io (+ Uniswap via Dexscreener for ETH/BTC)
-# Hosting: любой сервис, где можно выставить переменные среды:
-#   TELEGRAM_TOKEN, TELEGRAM_CHAT_ID (второе можно не задавать — бот привяжется по /start)
-# Keepalive: aiohttp /health (удобно для аптайм‑монитора)
+# file: main.py
+"""
+Unified 24/7 Signals Bot — Webhook (Render), CEX+DEX scanner, human-readable trade alerts
+
+Goal (from spec):
+- Webhooks only (no polling) — stable on Render (fix 409)
+- Planner: frequent scan for BTC/ETH, slower for alts/memes
+- Autosignals: EMA(12/26) cross with EMA200 filter; RSI; pump/accel (% over window + z-score); scalp
+- Anti-noise: min volume/liquidity, trend check, wick filter, dedupe
+- DEX safety: whitelist networks/DEX, liq/vol/age thresholds, no honeypot (best-effort via DexScreener)
+- Risk block in message: SL/TP (fixed % or R), position sizing hint
+- Platforms suggested (no Binance): CEX: MEXC, KuCoin, Gate.io, Bybit; DEX: Jupiter/Raydium (Sol), Pancake v3 (BSC), Uniswap v3 (Arbitrum/Polygon), SunSwap (TRON)
+- Privacy flags: privacy_mode, dex_only, show_platform, region UA/DE (advisory-only)
+
+ENV (Render → Environment Variables):
+  TELEGRAM_TOKEN, CHAT_ID(optional), WEBHOOK_BASE, WEBHOOK_SECRET
+Optionally tune defaults with: DEFAULT_STRONG, DEFAULT_WINDOW, DEFAULT_SL, DEFAULT_TP, DEFAULT_DEBOUNCE
+
+Start on Render:
+  Build:  pip install -r requirements.txt
+  Start:  python3 main.py
+
+"""
+from __future__ import annotations
 
 import os
 import time
+import json
 import math
 import threading
-import asyncio
-from collections import deque
+import statistics
+from collections import deque, defaultdict
 from dataclasses import dataclass, field
-from typing import Dict, Tuple, Optional, List, Deque
+from typing import Deque, Dict, Iterable, List, Optional, Tuple
 
 import requests
+from flask import Flask, request, jsonify
 import telebot
-from aiohttp import web
+from telebot import types
 
+# -----------------------------
+# Config / Defaults
+# -----------------------------
+TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+if not TOKEN:
+    raise SystemExit("TELEGRAM_TOKEN missing in ENV")
 
-# ====================== CONFIG ======================
+CHAT_ID = int(os.getenv("CHAT_ID", "0") or 0)
+WEBHOOK_BASE = os.getenv("WEBHOOK_BASE", "").rstrip("/")  # e.g. https://crypto-bot-xxxx.onrender.com
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "hook")       # random path segment
 
+# Runtime flags (chat commands will update these in-process)
 @dataclass
-class ProviderCfg:
-    enabled: bool = True
-    eta_min: int = 5  # примерное время перевода (минуты)
+class RuntimeCFG:
+    # watchlists
+    assets_top: List[str] = field(default_factory=lambda: ["BTC", "ETH"])
+    assets_alts: List[str] = field(default_factory=lambda: ["SOL", "TON", "XRP", "BNB", "ADA", "TRX"])
+    assets_memes: List[str] = field(default_factory=lambda: ["DOGE", "SHIB", "PEPE", "WIF", "BONK", "FLOKI"])
 
-@dataclass
-class Fees:
-    buy_pct: float = 0.10   # комиссия покупки, %
-    sell_pct: float = 0.10  # комиссия продажи, %
-    swap_pct: float = 0.00  # своп (для DEX, по умолчанию 0 тут)
-    dep_usdt: float = 0.0   # депо в USDT
-    wd_usdt: float = 0.0    # вывод в USDT
+    # windows & thresholds
+    window_sec: int = int(os.getenv("DEFAULT_WINDOW", "600").rstrip("m"))  # seconds, default 10m
+    strong_z: float = float(os.getenv("DEFAULT_STRONG", "2.2"))  # z-score/σ threshold for pump
+    move_pct_top: float = 0.8   # softer for BTC/ETH (per 5–10m)
+    move_pct_alt: float = 1.2
+    move_pct_meme: float = 2.0
 
-@dataclass
-class Config:
-    # наблюдаемые активы
-    watch: List[str] = field(default_factory=lambda: [
-        "BTC","ETH","SOL","TON","BNB","XRP","ADA","TRX",
-        "DOGE","SHIB","PEPE","FLOKI","WIF","BONK"
-    ])
-
-    # окно и пороги сигналов
-    window_min: int = 10
-    strong_move_pct: float = 2.2  # «сильный толчок»
-    debounce_sec: int = 1200      # анти-спам
-
-    # индикаторы
+    # EMA/RSI settings
     ema_fast: int = 12
     ema_slow: int = 26
-    ema200_on: bool = True
-    rsi_period: int = 14
-    rsi_hot: int = 68
-    rsi_cold: int = 32
+    ema_trend: int = 200
+    rsi_len: int = 14
+    require_trend: bool = True
 
-    # риск‑менеджмент
-    sl_pct: float = 1.8
-    tp_pcts: List[float] = field(default_factory=lambda: [1.5, 2.5, 4.0])
+    # risk & outputs
+    sl_pct: float = float(os.getenv("DEFAULT_SL", "1.8"))
+    tp_list: List[float] = field(default_factory=lambda: [float(x) for x in os.getenv("DEFAULT_TP", "1.5 2.5 4").split()])
+    balance_usdt: float = 50.0
+    risk_pct: float = 1.5  # percent of balance at risk per trade
 
-    # источники и комиссии
-    providers: Dict[str, ProviderCfg] = field(default_factory=lambda: {
-        "MEXC":   ProviderCfg(True, 5),
-        "KuCoin": ProviderCfg(True, 5),
-        "Gate.io":ProviderCfg(True, 6),
-        "DEX":    ProviderCfg(True, 3),  # используется только для цены ETH/BTC
-    })
-    fees: Dict[str, Fees] = field(default_factory=lambda: {
-        "MEXC":   Fees(0.10, 0.10),
-        "KuCoin": Fees(0.10, 0.10),
-        "Gate.io":Fees(0.20, 0.20),
-        "DEX":    Fees(0.00, 0.00, swap_pct=0.30),
-    })
+    # anti-noise
+    min_quote_vol_24h: float = 5_000_000.0  # CEX quote 24h vol minimal
+    meme_quote_vol_24h: float = 10_000_000.0
+    dedupe_sec: int = int(os.getenv("DEFAULT_DEBOUNCE", "900"))
 
-    # арбитраж
-    arb_on: bool = True
-    arb_min_profit_pct: float = 3.0
-    arb_max_eta: int = 20
+    # DEX safety (DexScreener)
+    dex_min_liq_usd: float = 300_000.0
+    dex_min_vol24_usd: float = 500_000.0
+    dex_min_age_days: int = 30
 
-CFG = Config()
+    # privacy & region
+    privacy_mode: bool = True
+    dex_only: bool = False
+    show_platform: bool = True
+    region: str = "UA"  # UA | DE
 
-# Dexscreener адреса (ETH=WETH, BTC=WBTC ERC20)
-DEX_TOKEN_ADDR = {
-    "ETH": "0xC02aaA39b223FE8D0A0E5C4F27eAD9083C756Cc2",  # WETH
-    "BTC": "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599",  # WBTC
+    # scheduler cadence (seconds)
+    scan_top_sec: Tuple[int, int] = (15, 30)   # range (min,max) randomized
+    scan_alts_sec: Tuple[int, int] = (30, 60)
+    scan_memes_sec: Tuple[int, int] = (60, 300)
+
+CFG = RuntimeCFG()
+
+# Fees for net (maker/taker rough)
+@dataclass
+class Fees:
+    buy_pct: float = 0.1
+    sell_pct: float = 0.1
+    swap_pct: float = 0.0
+    deposit_usdt: float = 0.0
+    withdraw_usdt: float = 0.0
+
+FEES: Dict[str, Fees] = {
+    "MEXC": Fees(0.1, 0.1),
+    "KuCoin": Fees(0.1, 0.1),
+    "Gate.io": Fees(0.2, 0.2),
 }
-DEX_USDT = "0xdAC17F958D2ee523a2206206994597C13D831ec7"
 
-TRADE_URLS = {
-    "MEXC":   "https://www.mexc.com/exchange/{asset}_USDT",
-    "KuCoin": "https://www.kucoin.com/trade/{asset}-USDT",
-    "Gate.io":"https://www.gate.io/trade/{asset}_USDT",
-}
-SAFE_HOSTS = {"www.mexc.com","www.kucoin.com","www.gate.io"}
-
-# токен/чат
-TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
-CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "0") or 0)
-if not TOKEN:
-    print("❌ TELEGRAM_TOKEN отсутствует в переменных среды")
-    raise SystemExit(1)
-
+# -----------------------------
+# Bot & Webhook Server
+# -----------------------------
 bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
+app = Flask(__name__)
 
-# ====================== PROVIDERS ======================
+PORT = int(os.getenv("PORT", "8080"))
 
-def mexc(symbol: str) -> Optional[Tuple[float, float]]:
-    url = f"https://api.mexc.com/api/v3/ticker/bookTicker?symbol={symbol}USDT"
+# Health endpoint for Render + UptimeRobot
+@app.get("/health")
+def _health():
+    return ("OK", 200, {"Content-Type": "text/plain"})
+
+# Set webhook on root hit (optional convenience)
+@app.get("/")
+def _root():
     try:
-        d = requests.get(url, timeout=6).json()
-        bid = float(d.get("bidPrice", 0) or 0)
-        ask = float(d.get("askPrice", 0) or 0)
-        return (bid, ask) if bid > 0 and ask > 0 else None
-    except Exception:
-        return None
+        bot.remove_webhook()
+        if not WEBHOOK_BASE:
+            return ("Set WEBHOOK_BASE env", 200)
+        hook_url = f"{WEBHOOK_BASE}/telegram/{WEBHOOK_SECRET}"
+        bot.set_webhook(url=hook_url)
+        return (f"Webhook set → {hook_url}", 200)
+    except Exception as e:
+        return (f"Webhook error: {e}", 500)
 
-def kucoin(symbol: str) -> Optional[Tuple[float, float]]:
-    url = f"https://api.kucoin.com/api/v1/market/orderbook/level1?symbol={symbol}-USDT"
+# Telegram webhook endpoint
+@app.post(f"/telegram/<secret>")
+def _telegram(secret: str):
+    if secret != WEBHOOK_SECRET:
+        return ("forbidden", 403)
     try:
-        d = requests.get(url, timeout=6).json()
-        if d.get("code") != "200000":
-            return None
-        data = d.get("data", {})
-        bid = float(data.get("bestBidPrice", data.get("bestBid", 0)) or 0)
-        ask = float(data.get("bestAskPrice", data.get("bestAsk", 0)) or 0)
-        return (bid, ask) if bid > 0 and ask > 0 else None
-    except Exception:
-        return None
+        update = telebot.types.Update.de_json(request.data.decode("utf-8"))
+        bot.process_new_updates([update])
+    except Exception as e:
+        print("webhook error:", e)
+    return ("!", 200)
 
-def gate(symbol: str) -> Optional[Tuple[float, float]]:
-    url = f"https://api.gateio.ws/api/v4/spot/order_book?currency_pair={symbol}_USDT&limit=1"
-    try:
-        d = requests.get(url, timeout=6).json()
-        bids = d.get("bids", [])
-        asks = d.get("asks", [])
-        bid = float(bids[0][0]) if bids else 0.0
-        ask = float(asks[0][0]) if asks else 0.0
-        return (bid, ask) if bid > 0 and ask > 0 else None
-    except Exception:
-        return None
+# -----------------------------
+# Price Providers (CEX)
+# -----------------------------
+# Simple, rate-limit friendly requests with retry
 
-PROVIDER_FUN = {
-    "MEXC": mexc,
-    "KuCoin": kucoin,
-    "Gate.io": gate,
-}
-
-def dex_uniswap_usd(symbol: str) -> Optional[float]:
-    addr = DEX_TOKEN_ADDR.get(symbol)
-    if not addr:
-        return None
-    try:
-        d = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{addr}", timeout=8).json()
-        pairs = d.get("pairs", []) if isinstance(d, dict) else []
-        best = None
-        for p in pairs:
-            if p.get("chainId") == "ethereum":
-                q = p.get("quoteToken", {})
-                if (q.get("address", "") or "").lower() == DEX_USDT.lower():
-                    price = float(p.get("priceUsd", 0) or 0)
-                    if price > 0:
-                        best = price if best is None or price < best else best
-        return best
-    except Exception:
-        return None
-
-# ====================== SERIES / INDICATORS ======================
-
-class Series:
-    def __init__(self, rsi_period: int):
-        self.buf: Deque[Tuple[float, float]] = deque(maxlen=5000)
-        self.ema_f: Optional[float] = None
-        self.ema_s: Optional[float] = None
-        self.ema_200: Optional[float] = None
-        self.last_cross: Optional[str] = None  # 'bull'|'bear'
-        self.rsi_period = rsi_period
-        self.rsi_prices: Deque[float] = deque(maxlen=rsi_period + 1)
-
-    def add(self, price: float) -> None:
-        ts = time.time()
-        self.buf.append((ts, price))
-        self.rsi_prices.append(price)
-
-        kf = 2 / (CFG.ema_fast + 1)
-        ks = 2 / (CFG.ema_slow + 1)
-        k200 = 2 / (200 + 1)
-
-        self.ema_f = price if self.ema_f is None else (price - self.ema_f) * kf + self.ema_f
-        self.ema_s = price if self.ema_s is None else (price - self.ema_s) * ks + self.ema_s
-        self.ema_200 = price if self.ema_200 is None else (price - self.ema_200) * k200 + self.ema_200
-
-    def pct_move(self, minutes: int) -> Optional[float]:
-        if not self.buf:
-            return None
-        cutoff = time.time() - minutes * 60
-        base = None
-        for ts, px in self.buf:
-            if ts >= cutoff:
-                base = px
-                break
-        if base is None:
-            base = self.buf[0][1]
-        last = self.buf[-1][1]
-        return (last - base) / base * 100 if base > 0 else None
-
-    def rsi(self) -> Optional[float]:
-        if len(self.rsi_prices) < self.rsi_period + 1:
-            return None
-        gains = 0.0
-        losses = 0.0
-        prev = None
-        for p in self.rsi_prices:
-            if prev is not None:
-                ch = p - prev
-                if ch > 0:
-                    gains += ch
-                else:
-                    losses += -ch
-            prev = p
-        avg_gain = gains / self.rsi_period
-        avg_loss = losses / self.rsi_period
-        if avg_loss == 0:
-            return 100.0
-        rs = avg_gain / avg_loss
-        return 100 - (100 / (1 + rs))
-
-    def cross(self) -> Optional[str]:
-        if self.ema_f is None or self.ema_s is None:
-            return None
-        cur = 'bull' if self.ema_f >= self.ema_s else 'bear'
-        if self.last_cross is None:
-            self.last_cross = cur
-            return None
-        if cur != self.last_cross:
-            self.last_cross = cur
-            return cur
-        return None
-
-
-SERIES: Dict[str, Series] = {s: Series(CFG.rsi_period) for s in CFG.watch}
-ALERTS_ON = True
-LAST_SENT: Dict[str, float] = {}
-
-# ====================== UTILS ======================
-
-def provider_trade_url(ex: str, asset: str) -> Optional[str]:
-    tpl = TRADE_URLS.get(ex)
-    if not tpl:
-        return None
-    try:
-        url = tpl.format(asset=asset)
-        # для безопасности проверим хост
-        from urllib.parse import urlparse
-        if urlparse(url).netloc in SAFE_HOSTS:
-            return url
-    except Exception:
-        pass
+def _http_get(url: str, timeout: int = 8) -> Optional[dict|list]:
+    for _ in range(2):
+        try:
+            r = requests.get(url, timeout=timeout, headers={"User-Agent": "SignalsBot/1.0"})
+            if r.status_code == 200:
+                return r.json()
+        except Exception:
+            time.sleep(0.5)
     return None
 
+# MEXC
+
+def mexc_book(symbol: str) -> Optional[Tuple[float, float]]:
+    d = _http_get(f"https://api.mexc.com/api/v3/ticker/bookTicker?symbol={symbol}USDT")
+    if isinstance(d, dict):
+        try:
+            bid = float(d.get("bidPrice", 0) or 0)
+            ask = float(d.get("askPrice", 0) or 0)
+            return (bid, ask) if bid > 0 and ask > 0 else None
+        except Exception:
+            return None
+    return None
+
+def mexc_24h(symbol: str) -> Optional[float]:
+    d = _http_get(f"https://api.mexc.com/api/v3/ticker/24hr?symbol={symbol}USDT")
+    if isinstance(d, dict):
+        try:
+            qv = float(d.get("quoteVolume", 0) or 0)
+            return qv
+        except Exception:
+            return None
+    return None
+
+# KuCoin
+
+def kucoin_book(symbol: str) -> Optional[Tuple[float, float]]:
+    d = _http_get(f"https://api.kucoin.com/api/v1/market/orderbook/level1?symbol={symbol}-USDT")
+    if isinstance(d, dict) and d.get("code") == "200000":
+        data = d.get("data", {})
+        try:
+            bid = float(data.get("bestBidPrice", data.get("bestBid", 0)) or 0)
+            ask = float(data.get("bestAskPrice", data.get("bestAsk", 0)) or 0)
+            return (bid, ask) if bid > 0 and ask > 0 else None
+        except Exception:
+            return None
+    return None
+
+def kucoin_24h(symbol: str) -> Optional[float]:
+    d = _http_get(f"https://api.kucoin.com/api/v1/market/stats?symbol={symbol}-USDT")
+    if isinstance(d, dict) and d.get("code") == "200000":
+        data = d.get("data", {})
+        try:
+            qv = float(data.get("volValue", 0) or 0)  # quote volume
+            return qv
+        except Exception:
+            return None
+    return None
+
+# Gate.io
+
+def gate_book(symbol: str) -> Optional[Tuple[float, float]]:
+    d = _http_get(f"https://api.gateio.ws/api/v4/spot/order_book?currency_pair={symbol}_USDT&limit=1")
+    if isinstance(d, dict):
+        try:
+            bids = d.get("bids", [])
+            asks = d.get("asks", [])
+            bid = float(bids[0][0]) if bids else 0.0
+            ask = float(asks[0][0]) if asks else 0.0
+            return (bid, ask) if bid > 0 and ask > 0 else None
+        except Exception:
+            return None
+    return None
+
+def gate_24h(symbol: str) -> Optional[float]:
+    d = _http_get(f"https://api.gateio.ws/api/v4/spot/tickers?currency_pair={symbol}_USDT")
+    if isinstance(d, list) and d:
+        try:
+            qv = float(d[0].get("quote_volume", 0) or 0)
+            return qv
+        except Exception:
+            return None
+    return None
+
+CEX_FUN = {
+    "MEXC": (mexc_book, mexc_24h),
+    "KuCoin": (kucoin_book, kucoin_24h),
+    "Gate.io": (gate_book, gate_24h),
+}
+
+# -----------------------------
+# DEX via DexScreener (best-effort)
+# -----------------------------
+# Token address map for common DEX assets
+DEX_TOKEN_ADDR = {
+    # ETH/WBTC (ERC), used sparsely
+    "ETH": "0xC02aaA39b223FE8D0A0E5C4F27eAD9083C756Cc2",  # WETH
+    "BTC": "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599",  # WBTC
+    # Solana (addresses are base58, DexScreener supports chain=solana by token address)
+    "SOL": None,  # native (use CEX mid instead)
+    "WIF": "Es9vMFrzaCER…PLACEHOLDER",  # NOTE: fill correct address if needed
+    "BONK": "DezX…PLACEHOLDER",
+}
+# NOTE: For safety, we will rely on CEX prices for now for most assets; DexScreener used to validate liq/vol for a subset.
+
+
+def dexscreener_token(addr: str) -> Optional[dict]:
+    d = _http_get(f"https://api.dexscreener.com/latest/dex/tokens/{addr}")
+    return d if isinstance(d, dict) else None
+
+
+def dex_metrics_for(asset: str) -> Optional[Tuple[float, float, float, int]]:
+    """Return (best_price_usd, liq_usd, vol24_usd, age_days) if available"""
+    addr = DEX_TOKEN_ADDR.get(asset)
+    if not addr:
+        return None
+    d = dexscreener_token(addr)
+    if not d:
+        return None
+    pairs = d.get("pairs", [])
+    best_price = None
+    best_liq = 0.0
+    best_vol24 = 0.0
+    best_age_days = 0
+    now_ms = int(time.time() * 1000)
+    for p in pairs:
+        try:
+            price = float(p.get("priceUsd", 0) or 0)
+            liq = float(p.get("liquidity", {}).get("usd", 0) or 0)
+            vol24 = float(p.get("volume", {}).get("h24", 0) or 0)
+            created = int(p.get("pairCreatedAt", 0) or 0)
+            age_days = max(0, int((now_ms - created) / (1000 * 60 * 60 * 24))) if created else 0
+            if price > 0 and liq > best_liq:
+                best_price, best_liq, best_vol24, best_age_days = price, liq, vol24, age_days
+        except Exception:
+            pass
+    if best_price:
+        return (best_price, best_liq, best_vol24, best_age_days)
+    return None
+
+# -----------------------------
+# Series, EMA/RSI, pump/accel
+# -----------------------------
+@dataclass
+class Series:
+    prices: Deque[Tuple[float, float]] = field(default_factory=lambda: deque(maxlen=6000))  # (ts, price)
+    ema_f: Optional[float] = None
+    ema_s: Optional[float] = None
+    ema_t: Optional[float] = None
+    rsi_avg_gain: Optional[float] = None
+    rsi_avg_loss: Optional[float] = None
+    last_price: Optional[float] = None
+
+    def add(self, price: float):
+        ts = time.time()
+        self.prices.append((ts, price))
+        # EMA updates
+        kf = 2 / (CFG.ema_fast + 1)
+        ks = 2 / (CFG.ema_slow + 1)
+        kt = 2 / (CFG.ema_trend + 1)
+        self.ema_f = price if self.ema_f is None else (price - self.ema_f) * kf + self.ema_f
+        self.ema_s = price if self.ema_s is None else (price - self.ema_s) * ks + self.ema_s
+        self.ema_t = price if self.ema_t is None else (price - self.ema_t) * kt + self.ema_t
+        # RSI (Wilder)
+        if self.last_price is not None:
+            change = price - self.last_price
+            gain = max(0.0, change)
+            loss = max(0.0, -change)
+            if self.rsi_avg_gain is None:
+                self.rsi_avg_gain = gain
+                self.rsi_avg_loss = loss
+            else:
+                n = CFG.rsi_len
+                self.rsi_avg_gain = (self.rsi_avg_gain * (n - 1) + gain) / n
+                self.rsi_avg_loss = (self.rsi_avg_loss * (n - 1) + loss) / n
+        self.last_price = price
+
+    def rsi(self) -> Optional[float]:
+        if self.rsi_avg_gain is None or self.rsi_avg_loss is None:
+            return None
+        if self.rsi_avg_loss == 0:
+            return 100.0
+        rs = self.rsi_avg_gain / self.rsi_avg_loss
+        return 100 - (100 / (1 + rs))
+
+    def pct_move(self, seconds: int) -> Optional[float]:
+        if not self.prices:
+            return None
+        cutoff = time.time() - seconds
+        base = None
+        for ts, p in self.prices:
+            if ts >= cutoff:
+                base = p
+                break
+        if base is None:
+            base = self.prices[0][1]
+        last = self.prices[-1][1]
+        return ((last - base) / base * 100.0) if base > 0 else None
+
+    def zscore(self, window: int = 30) -> Optional[float]:
+        # z-score of short returns (last window samples)
+        if len(self.prices) < window + 1:
+            return None
+        returns = []
+        last = None
+        for _, p in list(self.prices)[-window-1:]:
+            if last is not None and last > 0:
+                returns.append((p - last) / last)
+            last = p
+        if len(returns) < 3:
+            return None
+        m = statistics.mean(returns)
+        s = statistics.pstdev(returns) or 1e-9
+        cur = returns[-1]
+        return (cur - m) / s
+
+SERIES: Dict[str, Series] = defaultdict(Series)
+LAST_SENT: Dict[str, float] = {}
+SIGNALS_ON: bool = True
+ARB_ON: bool = False
+ARB_THRESH_NET: float = 3.0
+
+# -----------------------------
+# Helpers: platforms & messages
+# -----------------------------
+DEX_BY_ASSET = {
+    "BTC": ["PancakeSwap v3 (BSC)"],
+    "ETH": ["Uniswap v3 (Arbitrum)", "Uniswap v3 (Polygon)"]
+            ,
+    "SOL": ["Jupiter (Solana)", "Raydium (Solana)"],
+    "TRX": ["SunSwap (TRON)"],
+    "USDT": ["Jupiter (Solana)", "PancakeSwap v3 (BSC)"],
+    "WIF": ["Jupiter (Solana)"],
+    "BONK": ["Jupiter (Solana)", "Raydium (Solana)"],
+    "PEPE": ["Uniswap v3 (Arbitrum)"],
+    "FLOKI": ["PancakeSwap v3 (BSC)"]
+}
+
+CEX_BY_REGION = {
+    "UA": ["MEXC", "Gate.io", "KuCoin", "Bybit"],
+    "DE": ["Kraken", "Bitstamp", "Gate.io", "MEXC"],  # advisory-only
+}
+
+TRADE_URLS = {
+    "MEXC": "https://www.mexc.com/exchange/{asset}_USDT",
+    "KuCoin": "https://www.kucoin.com/trade/{asset}-USDT",
+    "Gate.io": "https://www.gate.io/trade/{asset}_USDT",
+}
+
+SAFE_HOSTS = {"www.mexc.com", "www.kucoin.com", "www.gate.io"}
+
+
+def suggest_platform(symbol: str) -> Tuple[str, str]:
+    s = symbol.upper()
+    if CFG.privacy_mode or CFG.dex_only:
+        lst = DEX_BY_ASSET.get(s, [])
+        if lst:
+            return ("DEX", lst[0])
+    lst = CEX_BY_REGION.get(CFG.region, [])
+    if lst:
+        return ("CEX", lst[0])
+    return ("CEX", "Gate.io")
+
+
+def position_size(entry: float, sl_price: float) -> float:
+    risk_usd = CFG.balance_usdt * (CFG.risk_pct / 100.0)
+    per_unit = max(1e-8, abs(entry - sl_price))
+    qty = risk_usd / per_unit
+    notional = qty * entry
+    # Clamp by balance
+    return round(min(notional, CFG.balance_usdt), 2)
+
+
+def build_trade_message(
+    symbol: str,
+    direction: str,  # LONG/SHORT
+    price: float,
+    sl_price: float,
+    tp_prices: List[float],
+    reason: str,
+    move_pct: Optional[float] = None,
+    rsi: Optional[float] = None,
+    vol_hint: Optional[str] = None,
+) -> Tuple[str, Optional[types.InlineKeyboardMarkup]]:
+    kind, platform = suggest_platform(symbol)
+    side = "BUY" if direction == "LONG" else "SELL"
+    move_txt = f" | Δ {move_pct:+.2f}%" if move_pct is not None else ""
+    rsi_txt = f"RSI {rsi:.0f}" if rsi is not None else "RSI n/a"
+    platform_line = (
+        f"Платформа: <b>{platform}</b>" if (CFG.show_platform and platform) else "Платформа: <i>скрыто</i>"
+    )
+    tp_part = ", ".join([f"{p:,.2f}$" for p in tp_prices])
+    sl_pct = (price - sl_price) / price * 100.0 if direction == "LONG" else (sl_price - price) / price * 100.0
+    size_usd = position_size(price, sl_price)
+
+    text = (
+        f"⚡ <b>{symbol}/USDT</b> | {direction}{move_txt}\n"
+        f"Цена: <b>{price:,.2f}$</b>\n"
+        f"РЕКОМЕНДАЦИЯ: <b>{side}</b>  ▶ {platform_line}\n"
+        f"SL: <b>{sl_price:,.2f}$</b> ({sl_pct:.2f}%) | TP: {tp_part}\n"
+        f"Размер: ~{size_usd:,.2f} USDT\n"
+        f"Причина: {reason} | {rsi_txt}{(' | ' + vol_hint) if vol_hint else ''}"
+    )
+
+    kb = None
+    if kind == "CEX" and CFG.show_platform and platform in TRADE_URLS:
+        url = TRADE_URLS[platform].format(asset=symbol)
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton(text=f"Открыть в {platform}", url=url))
+    elif kind == "DEX" and CFG.show_platform:
+        # Short hint only
+        text += "\nСети с низкими комиссиями: Solana/BSC/Arbitrum/Polygon"
+
+    return text, kb
+
+
+def safe_send(text: str, kb: Optional[types.InlineKeyboardMarkup] = None):
+    global CHAT_ID
+    if CHAT_ID == 0:
+        print("[send skipped] CHAT_ID not set yet")
+        return
+    try:
+        bot.send_message(CHAT_ID, text, reply_markup=kb, disable_web_page_preview=True)
+    except Exception as e:
+        print("send_message error:", e)
+
+# -----------------------------
+# Signals Engine
+# -----------------------------
+
 def mid_price(symbol: str) -> Optional[float]:
-    vals: List[float] = []
-    for ex, fn in PROVIDER_FUN.items():
-        if not CFG.providers.get(ex, ProviderCfg()).enabled:
-            continue
-        q = fn(symbol)
+    vals = []
+    for ex, (book_fn, _vol_fn) in CEX_FUN.items():
+        q = book_fn(symbol)
         if q:
             bid, ask = q
-            vals.append((bid + ask) / 2.0)
+            vals.append((bid + ask) / 2)
     if not vals:
         return None
     return sum(vals) / len(vals)
 
-def best_entry_exchange(symbol: str, side: str) -> Optional[Tuple[str, float]]:
-    """
-    side: 'long' -> минимальный ask; 'short' -> максимальный bid (формально, для спота это ориентир)
-    """
-    best_ex = None
-    best_px = None
-    for ex, fn in PROVIDER_FUN.items():
-        if not CFG.providers.get(ex, ProviderCfg()).enabled:
-            continue
-        q = fn(symbol)
-        if not q:
-            continue
-        bid, ask = q
-        if side == 'long':
-            px = ask
-            if best_px is None or px < best_px:
-                best_px = px
-                best_ex = ex
-        else:
-            px = bid
-            if best_px is None or px > best_px:
-                best_px = px
-                best_ex = ex
-    if best_ex is None or best_px is None:
-        return None
-    return best_ex, best_px
+
+def vol24_quote(symbol: str) -> float:
+    total = 0.0
+    for ex, (_book, vol_fn) in CEX_FUN.items():
+        v = vol_fn(symbol)
+        if v:
+            total += v
+    return total
+
+
+def should_signal(symbol: str, ser: Series) -> Tuple[Optional[str], Optional[str]]:
+    """Return (direction, reason) or (None, None). Applies EMA cross + trend + pump/accel filters."""
+    if ser.ema_f is None or ser.ema_s is None:
+        return (None, None)
+    direction = None
+    if ser.ema_f >= ser.ema_s:
+        direction = "LONG"
+        cross = "EMA BULL cross"
+    else:
+        direction = "SHORT"
+        cross = "EMA BEAR cross"
+
+    # Trend filter (EMA200)
+    if CFG.require_trend and ser.ema_t is not None:
+        if direction == "LONG" and ser.last_price is not None and ser.last_price < ser.ema_t:
+            return (None, None)
+        if direction == "SHORT" and ser.last_price is not None and ser.last_price > ser.ema_t:
+            return (None, None)
+
+    # Pump/scalp filters
+    move = ser.pct_move(CFG.window_sec) or 0.0
+    z = ser.zscore() or 0.0
+
+    # per-asset baseline
+    s = symbol.upper()
+    base = CFG.move_pct_top if s in CFG.assets_top else (CFG.move_pct_alt if s in CFG.assets_alts else CFG.move_pct_meme)
+
+    # Require both: strong move and z-score
+    if abs(move) < base:
+        return (None, None)
+    if abs(z) < CFG.strong_z:
+        return (None, None)
+
+    # Acceleration heuristic: last two windows rising in same direction (approx with z>0 trend)
+    # (Simplified; using z as accel proxy.)
+    if direction == "LONG" and z < 0:
+        return (None, None)
+    if direction == "SHORT" and z > 0:
+        return (None, None)
+
+    reason = f"{cross}, над EMA200" if (CFG.require_trend and direction == "LONG") else (cross)
+    reason += f", z={z:.1f}, Δ{move:+.2f}%/{int(CFG.window_sec/60)}m"
+    return (direction, reason)
+
+
+def dedupe_key(symbol: str, direction: str) -> str:
+    return f"{symbol}:{direction}:{int(time.time() / CFG.dedupe_sec)}"
+
+# -----------------------------
+# Arbitrage (optional, CEX↔CEX net)
+# -----------------------------
 
 def apply_fees(px: float, f: Fees, side: str) -> float:
     if side == 'buy':
-        return px * (1 + f.buy_pct / 100 + f.swap_pct / 100) + f.dep_usdt
-    return px * (1 - f.sell_pct / 100 - f.swap_pct / 100) - f.wd_usdt
+        return px * (1 + f.buy_pct / 100 + f.swap_pct / 100) + f.deposit_usdt
+    else:
+        return px * (1 - f.sell_pct / 100 - f.swap_pct / 100) - f.withdraw_usdt
 
-@dataclass
-class Opp:
-    asset: str
-    buy_ex: str
-    sell_ex: str
-    buy_px: float
-    sell_px: float
-    net_pct: float
-    eta: int
 
-def compute_arbitrage(symbols: List[str]) -> List[Opp]:
-    out: List[Opp] = []
-    quotes: Dict[str, Dict[str, Tuple[float, float]]] = {ex: {} for ex in PROVIDER_FUN}
-    for ex, fn in PROVIDER_FUN.items():
-        if not CFG.providers.get(ex, ProviderCfg()).enabled:
-            continue
+def scan_arbitrage(symbols: Iterable[str]) -> List[Tuple[str, str, str, float]]:
+    """Return top opportunities: (asset, buy_ex, sell_ex, net_pct)"""
+    quotes: Dict[str, Dict[str, Tuple[float, float]]] = {ex: {} for ex in CEX_FUN}
+    for ex, (book_fn, _vol_fn) in CEX_FUN.items():
         for s in symbols:
-            q = fn(s)
+            q = book_fn(s)
             if q:
                 quotes[ex][s] = q
-
+    out = []
     for s in symbols:
-        for buy_ex in PROVIDER_FUN.keys():
-            if s not in quotes.get(buy_ex, {}):
+        for buy_ex, qs in quotes.items():
+            if s not in qs:
                 continue
-            for sell_ex in PROVIDER_FUN.keys():
-                if sell_ex == buy_ex:
+            bid_buy, ask_buy = qs[s]
+            buy_net = apply_fees(ask_buy, FEES.get(buy_ex, Fees()), 'buy')
+            for sell_ex, qs2 in quotes.items():
+                if sell_ex == buy_ex or s not in qs2:
                     continue
-                if s not in quotes.get(sell_ex, {}):
+                bid_sell, _ask_sell = qs2[s]
+                sell_net = apply_fees(bid_sell, FEES.get(sell_ex, Fees()), 'sell')
+                if buy_net <= 0:
                     continue
-                bid_buy, ask_buy = quotes[buy_ex][s]
-                bid_sell, ask_sell = quotes[sell_ex][s]
-                buy = apply_fees(ask_buy, CFG.fees.get(buy_ex, Fees()), 'buy')
-                sell = apply_fees(bid_sell, CFG.fees.get(sell_ex, Fees()), 'sell')
-                if buy <= 0:
-                    continue
-                net = (sell - buy) / buy * 100.0
-                eta = CFG.providers.get(buy_ex, ProviderCfg()).eta_min + CFG.providers.get(sell_ex, ProviderCfg()).eta_min
-                if net >= CFG.arb_min_profit_pct and eta <= CFG.arb_max_eta:
-                    out.append(Opp(s, buy_ex, sell_ex, buy, sell, net, eta))
-    out.sort(key=lambda x: x.net_pct, reverse=True)
+                net = (sell_net - buy_net) / buy_net * 100
+                if net >= ARB_THRESH_NET:
+                    out.append((s, buy_ex, sell_ex, net))
+    out.sort(key=lambda x: x[3], reverse=True)
     return out[:3]
 
-def human_pct(x: float) -> str:
-    s = f"{x:.2f}"
-    s = s.replace(".00", "")
-    return s
+# -----------------------------
+# Scheduler loop
+# -----------------------------
+STOP_EVENT = threading.Event()
 
-def safe_send(text: str, buttons: Optional[List[Tuple[str, str]]] = None) -> None:
-    global CHAT_ID
-    if CHAT_ID == 0:
-        print("ℹ️ CHAT_ID не установлен. Отправьте /start в личный чат с ботом.")
-        return
-    markup = None
-    if buttons:
-        from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
-        kb = []
-        row = []
-        for label, url in buttons:
-            if url:
-                row.append(InlineKeyboardButton(text=label, url=url))
-        if row:
-            kb.append(row)
-        if kb:
-            markup = InlineKeyboardMarkup(kb)
-    try:
-        bot.send_message(CHAT_ID, text, disable_web_page_preview=True, reply_markup=markup)
-    except Exception as e:
-        print("send_message error:", e)
 
-def send_scalp_signal(s: str, direction: str, px: float, pm: float, rsi_val: Optional[float]) -> None:
-    pair = f"{s}/USDT"
-    sl = CFG.sl_pct
-    tps = ", ".join([f"{tp:.1f}%" for tp in CFG.tp_pcts])
-
-    # биржа для входа
-    best = best_entry_exchange(s, 'long' if direction == "LONG" else 'short')
-    ex_suggest = best[0] if best else "MEXC / KuCoin / Gate.io"
-
-    rsi_text = f"RSI={rsi_val:.1f}" if rsi_val is not None else "RSI=n/a"
-    text = (
-        f"🚀 <b>{s}</b> {('+' if pm>=0 else '')}{pm:.2f}% за {CFG.window_min} мин\n"
-        f"{pair} ≈ <b>{px:,.6f}$</b>\n"
-        f"EMA12 {'>' if direction=='LONG' else '<'} EMA26 | {rsi_text}\n"
-        f"Направление: <b>{direction}</b>\n"
-        f"Платформа: <b>{ex_suggest}</b>\n"
-        f"Подсказка: SL {sl:.1f}%, частичный TP {tps}"
-    )
-    safe_send(text)
-
-def send_ema_cross(s: str, kind: str, px: float) -> None:
-    text = f"⚡️ <b>{s}</b> EMA {kind.upper()} cross | {px:,.2f}$"
-    safe_send(text)
-
-def send_arb(o: Opp) -> None:
-    buttons = [
-        (f"Купить на {o.buy_ex}", provider_trade_url(o.buy_ex, o.asset)),
-        (f"Продать на {o.sell_ex}", provider_trade_url(o.sell_ex, o.asset)),
-    ]
-    text = (
-        "🔺 <b>Связка найдена</b>\n"
-        f"Buy: {o.buy_ex} — 1 {o.asset} = {o.buy_px:,.3f} $\n"
-        f"Sell: {o.sell_ex} — 1 {o.asset} = {o.sell_px:,.3f} $\n"
-        f"Net-профит: <b>+{o.net_pct:.2f}%</b> (после комиссий)\n"
-        f"Реком. объём: 20–40 USDT\n"
-        f"ETA сделки: ~{o.eta} мин"
-    )
-    safe_send(text, buttons=buttons)
-
-# ====================== ALERT LOOP ======================
-
-async def alert_loop() -> None:
-    global LAST_SENT
-    while True:
+def _scan_cycle(symbols: List[str]):
+    for s in symbols:
         try:
-            for s in list(CFG.watch):
-                px = mid_price(s)
-                if px is None:
-                    continue
-                SERIES.setdefault(s, Series(CFG.rsi_period)).add(px)
+            px = mid_price(s)
+            if px is None:
+                continue
+            ser = SERIES[s]
+            ser.add(px)
 
-                # EMA кросс
-                sig = SERIES[s].cross()
-                if sig:
-                    send_ema_cross(s, "BULL" if sig == 'bull' else "BEAR", px)
+            if not SIGNALS_ON:
+                continue
 
-                # «сильный» толчок
-                pm = SERIES[s].pct_move(CFG.window_min)
-                if pm is None:
-                    continue
+            # CEX 24h volume filter
+            qv = vol24_quote(s)
+            min_qv = CFG.meme_quote_vol_24h if s in CFG.assets_memes else CFG.min_quote_vol_24h
+            if qv < min_qv:
+                continue
 
-                # фильтр EMA200 (если включен и уже рассчитан)
-                ema_ok = True
-                if CFG.ema200_on:
-                    if SERIES[s].ema_f is not None and SERIES[s].ema_200 is not None:
-                        ema_ok = SERIES[s].ema_f >= SERIES[s].ema_200
-                    else:
-                        ema_ok = True  # ещё недостаточно точек — не блокируем
+            direction, reason = should_signal(s, ser)
+            if not direction:
+                continue
 
-                # ключ антиспама
-                direction = "LONG" if pm >= 0 else "SHORT"
-                key = f"scalp:{s}:{direction}"
-                cooldown_ok = (time.time() - LAST_SENT.get(key, 0)) > CFG.debounce_sec
+            # Dedupe
+            key = dedupe_key(s, direction)
+            if time.time() - LAST_SENT.get(key, 0) < CFG.dedupe_sec:
+                continue
+            LAST_SENT[key] = time.time()
 
-                if abs(pm) >= CFG.strong_move_pct and cooldown_ok and ema_ok:
-                    LAST_SENT[key] = time.time()
-                    rsi_val = SERIES[s].rsi()
-                    send_scalp_signal(s, direction, px, pm, rsi_val)
+            # Build trade levels
+            entry = ser.last_price or px
+            if direction == "LONG":
+                sl = entry * (1 - CFG.sl_pct / 100)
+                tp_prices = [entry * (1 + x / 100) for x in CFG.tp_list]
+            else:
+                sl = entry * (1 + CFG.sl_pct / 100)
+                tp_prices = [entry * (1 - x / 100) for x in CFG.tp_list]
 
-            # арбитраж
-            if CFG.arb_on:
-                base_syms = [x for x in CFG.watch if x in ("BTC","ETH","SOL","TON","BNB","XRP","ADA","TRX")]
-                opps = compute_arbitrage(base_syms)
-                for o in opps:
-                    k = f"arb:{o.asset}:{o.buy_ex}>{o.sell_ex}"
-                    if (time.time() - LAST_SENT.get(k, 0)) > max(CFG.debounce_sec // 2, 300):
-                        LAST_SENT[k] = time.time()
-                        send_arb(o)
-
+            rsi_val = ser.rsi()
+            vol_hint = f"24h vol ≈ {qv/1_000_000:.1f}M"
+            text, kb = build_trade_message(
+                symbol=s, direction=direction, price=entry,
+                sl_price=sl, tp_prices=[round(x, 4) for x in tp_prices],
+                reason=reason, move_pct=ser.pct_move(CFG.window_sec), rsi=rsi_val, vol_hint=vol_hint
+            )
+            safe_send(text, kb)
         except Exception as e:
-            print("alert_loop error:", e)
+            print("scan err", s, e)
 
-        await asyncio.sleep(12)  # частота опроса
 
-# ====================== COMMANDS ======================
+def _runner():
+    # Staggered loops with different cadences
+    import random
+    while not STOP_EVENT.is_set():
+        t0 = time.time()
+        _scan_cycle(CFG.assets_top)
+        time.sleep(random.uniform(*CFG.scan_top_sec))
+        _scan_cycle(CFG.assets_alts)
+        time.sleep(random.uniform(*CFG.scan_alts_sec))
+        _scan_cycle(CFG.assets_memes)
+        time.sleep(random.uniform(*CFG.scan_memes_sec))
+        if ARB_ON:
+            try:
+                opps = scan_arbitrage(CFG.assets_top + CFG.assets_alts)
+                for (asset, buy_ex, sell_ex, net) in opps:
+                    txt = (
+                        "🔥 Связка найдена\n"
+                        f"Buy: {buy_ex} — 1 {asset} по рынку\n"
+                        f"Sell: {sell_ex} — 1 {asset} по рынку\n"
+                        f"Net-профит: +{net:.2f}% (после комиссий)\n"
+                        f"Рекомм. объём: ~{min(40.0, CFG.balance_usdt):.2f} USDT"
+                    )
+                    safe_send(txt)
+            except Exception as e:
+                print("arb err:", e)
+        # Safety cap
+        dt = time.time() - t0
+        if dt < 1:
+            time.sleep(1)
 
-def parse_minutes(s: str) -> Optional[int]:
-    try:
-        s = s.strip().lower()
-        if s.endswith("m"):
-            return int(float(s[:-1]))
-        if s.endswith("min"):
-            return int(float(s[:-3]))
-        if s.endswith("h"):
-            return int(float(s[:-1]) * 60)
-        return int(float(s))
-    except Exception:
-        return None
+# Launch background scanner thread at import-time so it runs under Flask
+threading.Thread(target=_runner, daemon=True).start()
 
+# -----------------------------
+# Commands
+# -----------------------------
 @bot.message_handler(commands=["start"])
-def cmd_start(m):
+def _cmd_start(m):
     global CHAT_ID
     if CHAT_ID == 0:
         CHAT_ID = m.chat.id
-    bot.reply_to(m,
-        "Привет! Бот запущен ✅.\n"
-        "Команды: /status, /price BTC, /assets, /set_assets BTC,ETH,…\n"
-        "Сигналы: /signals on|off, /set_strong 2.2, /set_window 10m\n"
-        "Риск: /set_sl 1.8, /set_tp 1.5 2.5 4\n"
-        "Индикаторы: /ema200 on|off, /set_rsi 14\n"
-        "Арбитраж: /arb_on, /arb_off, /arb_thresh 3.0"
-    )
+    bot.reply_to(m, (
+        "Привет! Я 24/7 сканирую рынок и присылаю понятные сигналы.\n"
+        "/help — команды\n"
+        "/status — параметры\n"
+        "/signals on|off — включить/выключить авто-алерты\n"
+        "/set_assets BTC,ETH,SOL — наблюдаемый список (все классы)\n"
+        "/set_window 10m — окно для Δ% и z-score (в секундах или Xm)\n"
+        "/set_strong 2.2 — порог σ для пампов\n"
+        "/set_sl 1.8 | /set_tp 1.5 2.5 4 — риск\n"
+        "/ema200 on|off — фильтр по тренду\n"
+        "/set_rsi 14 — длина RSI\n"
+        "/debounce 900 — анти-спам (сек)\n"
+        "/arb_on|/arb_off, /arb_thresh 3.0 — арбитраж (опционально)\n"
+        "/privacy_on|off, /dex_only_on|off, /show_platform_on|off, /set_region UA|DE"
+    ))
 
 @bot.message_handler(commands=["help"])
-def cmd_help(m):
-    cmd_start(m)
+def _cmd_help(m):
+    bot.reply_to(m, (
+        "Команды:\n"
+        "/status\n"
+        "/signals on|off\n"
+        "/set_assets <список,через,запятую>\n"
+        "/set_window <число> или <Xm>\n"
+        "/set_strong <σ>\n"
+        "/set_sl <pct> | /set_tp <pct pct pct>\n"
+        "/ema200 on|off | /set_rsi <n> | /debounce <sec>\n"
+        "/arb_on|/arb_off | /arb_thresh <pct>\n"
+        "/privacy_on|off | /dex_only_on|off | /show_platform_on|off | /set_region UA|DE"
+    ))
 
 @bot.message_handler(commands=["status"])
-def cmd_status(m):
-    prov = ", ".join([f"{k}:{'ON' if v.enabled else 'OFF'}" for k,v in CFG.providers.items()])
-    tps = ", ".join([f"{x:.1f}%" for x in CFG.tp_pcts])
-    bot.reply_to(m,
-        f"Watch: {', '.join(CFG.watch)} | Profit≥{CFG.arb_min_profit_pct:.1f}%\n"
-        f"window={CFG.window_min}m, strong≥{CFG.strong_move_pct:.1f}%, debounce={CFG.debounce_sec}s\n"
-        f"EMA200={'ON' if CFG.ema200_on else 'OFF'}, RSI p={CFG.rsi_period} (hot {CFG.rsi_hot}/cold {CFG.rsi_cold})\n"
-        f"Risk: SL {CFG.sl_pct:.1f}%, TP {tps} | Arb={'ON' if CFG.arb_on else 'OFF'}\n"
-        f"Sources: {prov}"
-    )
+def _cmd_status(m):
+    lines = []
+    lines.append(f"Assets TOP: {', '.join(CFG.assets_top)}")
+    lines.append(f"Assets ALTS: {', '.join(CFG.assets_alts)}")
+    lines.append(f"Assets MEMES: {', '.join(CFG.assets_memes)}")
+    lines.append(f"Window: {CFG.window_sec}s | strong z≥{CFG.strong_z}")
+    lines.append(f"EMA: 12/26, trend200={'ON' if CFG.require_trend else 'OFF'} | RSI={CFG.rsi_len}")
+    lines.append(f"Risk: SL {CFG.sl_pct}% | TP {', '.join([str(x) for x in CFG.tp_list])}% | balance {CFG.balance_usdt}$ | risk {CFG.risk_pct}%")
+    lines.append(f"Anti-noise: min24hVol {CFG.min_quote_vol_24h/1_000_000:.1f}M, memes {CFG.meme_quote_vol_24h/1_000_000:.1f}M | debounce {CFG.dedupe_sec}s")
+    lines.append(f"Signals: {'ON' if SIGNALS_ON else 'OFF'} | Arb: {'ON' if ARB_ON else 'OFF'} (≥{ARB_THRESH_NET}%)")
+    lines.append(f"Privacy: {'ON' if CFG.privacy_mode else 'OFF'}, DEX-only: {'ON' if CFG.dex_only else 'OFF'}, Show platform: {'ON' if CFG.show_platform else 'OFF'}, Region: {CFG.region}")
+    bot.reply_to(m, "\n".join(lines))
 
-@bot.message_handler(commands=["assets"])
-def cmd_assets(m):
-    bot.reply_to(m, ", ".join(CFG.watch))
+@bot.message_handler(commands=["signals"])
+def _cmd_signals(m):
+    global SIGNALS_ON
+    parts = m.text.strip().split()
+    if len(parts) == 2 and parts[1].lower() in ("on", "off"):
+        SIGNALS_ON = (parts[1].lower() == "on")
+        bot.reply_to(m, f"Signals: {'ON' if SIGNALS_ON else 'OFF'}")
+    else:
+        bot.reply_to(m, "Использование: /signals on|off")
 
 @bot.message_handler(commands=["set_assets"])
-def cmd_set_assets(m):
+def _cmd_assets(m):
     raw = m.text.split(" ", 1)
     if len(raw) < 2:
-        bot.reply_to(m, "Использование: /set_assets BTC,ETH,SOL")
+        bot.reply_to(m, "Использование: /set_assets BTC,ETH,SOL,… (все классы)")
         return
     parts = [x.strip().upper() for x in raw[1].replace(";", ",").split(",") if x.strip()]
     if not parts:
         bot.reply_to(m, "Пустой список")
         return
-    CFG.watch = parts
-    for s in parts:
-        SERIES.setdefault(s, Series(CFG.rsi_period))
-    bot.reply_to(m, "OK. Watch обновлён.")
+    # naive repartition: top remains, others go to alts; memes preserved if present
+    top = [x for x in parts if x in ("BTC", "ETH")]
+    memes = [x for x in parts if x in CFG.assets_memes]
+    alts = [x for x in parts if x not in top and x not in memes]
+    CFG.assets_top = top or CFG.assets_top
+    CFG.assets_alts = alts or CFG.assets_alts
+    CFG.assets_memes = memes or CFG.assets_memes
+    bot.reply_to(m, f"OK. Обновлено. TOP={CFG.assets_top}, ALTS={CFG.assets_alts}, MEMES={CFG.assets_memes}")
 
-@bot.message_handler(commands=["price"])
-def cmd_price(m):
+@bot.message_handler(commands=["set_window"])
+def _cmd_window(m):
     parts = m.text.strip().split()
-    if len(parts) < 2:
-        bot.reply_to(m, "Использование: /price BTC")
+    if len(parts) != 2:
+        bot.reply_to(m, "Использование: /set_window 600 или 10m")
         return
-    sym = parts[1].upper()
-    lines = [f"<b>{sym}/USDT</b>"]
-    for ex in ("MEXC","KuCoin","Gate.io"):
-        if not CFG.providers[ex].enabled:
-            continue
-        try:
-            q = PROVIDER_FUN[ex](sym)
-            if q:
-                bid, ask = q
-                mid = (bid + ask) / 2.0
-                lines.append(f"{ex:<7} — {mid:,.6f} $ (mid)")
-            else:
-                lines.append(f"{ex:<7} — n/a")
-        except Exception:
-            lines.append(f"{ex:<7} — n/a")
-    if sym in ("ETH","BTC") and CFG.providers["DEX"].enabled:
-        px = dex_uniswap_usd(sym)
-        lines.append(f"Uniswap — {px:,.6f} $" if px else "Uniswap — n/a")
-    bot.reply_to(m, "\n".join(lines))
-
-@bot.message_handler(commands=["signals"])
-def cmd_signals(m):
-    parts = m.text.strip().split()
-    global ALERTS_ON
-    if len(parts) == 2 and parts[1].lower() in ("on","off"):
-        ALERTS_ON = (parts[1].lower() == "on")
-    bot.reply_to(m, f"Сигналы: {'ON' if ALERTS_ON else 'OFF'}")
+    v = parts[1].lower()
+    try:
+        if v.endswith('m'):
+            CFG.window_sec = int(float(v[:-1]) * 60)
+        else:
+            CFG.window_sec = int(v)
+        bot.reply_to(m, f"OK. Window={CFG.window_sec}s")
+    except Exception:
+        bot.reply_to(m, "Формат: 600 или 10m")
 
 @bot.message_handler(commands=["set_strong"])
-def cmd_set_strong(m):
+def _cmd_strong(m):
     parts = m.text.strip().split()
     try:
-        CFG.strong_move_pct = float(parts[1])
-        bot.reply_to(m, f"OK. strong = {CFG.strong_move_pct:.2f}%")
+        CFG.strong_z = float(parts[1])
+        bot.reply_to(m, f"OK. strong z≥{CFG.strong_z}")
     except Exception:
         bot.reply_to(m, "Использование: /set_strong 2.2")
 
-@bot.message_handler(commands=["set_window"])
-def cmd_set_window(m):
-    parts = m.text.strip().split()
-    if len(parts) < 2:
-        bot.reply_to(m, "Использование: /set_window 10m")
-        return
-    mins = parse_minutes(parts[1])
-    if mins is None or mins <= 0:
-        bot.reply_to(m, "Не понял число минут, пример: /set_window 10m")
-        return
-    CFG.window_min = mins
-    bot.reply_to(m, f"OK. window = {CFG.window_min} мин")
-
 @bot.message_handler(commands=["set_sl"])
-def cmd_set_sl(m):
+def _cmd_sl(m):
     parts = m.text.strip().split()
     try:
         CFG.sl_pct = float(parts[1])
-        bot.reply_to(m, f"OK. SL = {CFG.sl_pct:.2f}%")
+        bot.reply_to(m, f"OK. SL={CFG.sl_pct}%")
     except Exception:
         bot.reply_to(m, "Использование: /set_sl 1.8")
 
 @bot.message_handler(commands=["set_tp"])
-def cmd_set_tp(m):
-    parts = m.text.strip().split()
-    try:
-        tps = [float(x) for x in parts[1:]]
-        if not tps:
-            raise ValueError
-        CFG.tp_pcts = tps[:3]
-        bot.reply_to(m, "OK. TP = " + ", ".join([f"{x:.2f}%" for x in CFG.tp_pcts]))
-    except Exception:
+def _cmd_tp(m):
+    raw = m.text.split(" ", 1)
+    if len(raw) < 2:
         bot.reply_to(m, "Использование: /set_tp 1.5 2.5 4")
+        return
+    try:
+        parts = [float(x) for x in raw[1].split() if x.strip()]
+        if not parts:
+            raise ValueError
+        CFG.tp_list = parts
+        bot.reply_to(m, f"OK. TP set: {CFG.tp_list}")
+    except Exception:
+        bot.reply_to(m, "Формат: числа через пробел")
 
 @bot.message_handler(commands=["ema200"])
-def cmd_ema200(m):
+def _cmd_ema200(m):
     parts = m.text.strip().split()
-    if len(parts) == 2 and parts[1].lower() in ("on","off"):
-        CFG.ema200_on = (parts[1].lower() == "on")
-    bot.reply_to(m, f"EMA200: {'ON' if CFG.ema200_on else 'OFF'}")
+    if len(parts) != 2 or parts[1].lower() not in ("on", "off"):
+        bot.reply_to(m, "Использование: /ema200 on|off")
+        return
+    CFG.require_trend = (parts[1].lower() == "on")
+    bot.reply_to(m, f"EMA200 filter: {'ON' if CFG.require_trend else 'OFF'}")
 
 @bot.message_handler(commands=["set_rsi"])
-def cmd_set_rsi(m):
+def _cmd_rsi(m):
     parts = m.text.strip().split()
     try:
-        CFG.rsi_period = max(5, int(parts[1]))
-        for s in SERIES.values():
-            s.rsi_period = CFG.rsi_period
-            s.rsi_prices = deque(maxlen=CFG.rsi_period + 1)
-        bot.reply_to(m, f"OK. RSI period = {CFG.rsi_period}")
+        CFG.rsi_len = int(parts[1])
+        bot.reply_to(m, f"OK. RSI len={CFG.rsi_len}")
     except Exception:
         bot.reply_to(m, "Использование: /set_rsi 14")
 
-@bot.message_handler(commands=["arb_on"])
-def cmd_arb_on(m):
-    CFG.arb_on = True
-    bot.reply_to(m, "Arbitrage: ON")
-
-@bot.message_handler(commands=["arb_off"])
-def cmd_arb_off(m):
-    CFG.arb_on = False
-    bot.reply_to(m, "Arbitrage: OFF")
-
-@bot.message_handler(commands=["arb_thresh"])
-def cmd_arb_thr(m):
+@bot.message_handler(commands=["debounce"])
+def _cmd_debounce(m):
     parts = m.text.strip().split()
     try:
-        CFG.arb_min_profit_pct = float(parts[1])
-        bot.reply_to(m, f"OK. min profit = {CFG.arb_min_profit_pct:.2f}%")
+        CFG.dedupe_sec = int(parts[1])
+        bot.reply_to(m, f"OK. debounce={CFG.dedupe_sec}s")
+    except Exception:
+        bot.reply_to(m, "Использование: /debounce 1200")
+
+@bot.message_handler(commands=["arb_on"])
+def _cmd_arb_on(m):
+    global ARB_ON
+    ARB_ON = True
+    bot.reply_to(m, "Арбитраж: ON")
+
+@bot.message_handler(commands=["arb_off"])
+def _cmd_arb_off(m):
+    global ARB_ON
+    ARB_ON = False
+    bot.reply_to(m, "Арбитраж: OFF")
+
+@bot.message_handler(commands=["arb_thresh"])
+def _cmd_arb_thr(m):
+    global ARB_THRESH_NET
+    parts = m.text.strip().split()
+    try:
+        ARB_THRESH_NET = float(parts[1])
+        bot.reply_to(m, f"OK. arb threshold net={ARB_THRESH_NET}%")
     except Exception:
         bot.reply_to(m, "Использование: /arb_thresh 3.0")
 
-# ====================== KEEPALIVE ======================
+@bot.message_handler(commands=["privacy_on"])
+def _p_on(m):
+    CFG.privacy_mode = True
+    bot.reply_to(m, "Privacy mode: ON (DEX в приоритете, можно скрыть платформы)")
 
-async def _health(request):
-    return web.Response(text="OK", content_type="text/plain")
+@bot.message_handler(commands=["privacy_off"])
+def _p_off(m):
+    CFG.privacy_mode = False
+    bot.reply_to(m, "Privacy mode: OFF")
 
-async def _web_main():
-    app = web.Application()
-    app.router.add_get('/health', _health)
-    port = int(os.getenv('PORT', '8080'))
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', port)
-    await site.start()
-    print(f"🌐 Keepalive /health on {port}")
-    while True:
-        await asyncio.sleep(3600)
+@bot.message_handler(commands=["dex_only_on"])
+def _d_on(m):
+    CFG.dex_only = True
+    bot.reply_to(m, "DEX-only: ON")
 
-def _start_web():
-    def runner():
-        try:
-            asyncio.run(_web_main())
-        except Exception as e:
-            print("web error:", e)
-    threading.Thread(target=runner, daemon=True).start()
+@bot.message_handler(commands=["dex_only_off"])
+def _d_off(m):
+    CFG.dex_only = False
+    bot.reply_to(m, "DEX-only: OFF")
 
-# ====================== MAIN ======================
+@bot.message_handler(commands=["show_platform_on"])
+def _sp_on(m):
+    CFG.show_platform = True
+    bot.reply_to(m, "Показывать платформу: ON")
 
-def _poll():
-    while True:
-        try:
-            bot.infinity_polling(timeout=20, long_polling_timeout=20)
-        except Exception as e:
-            print("polling error:", e)
-            time.sleep(5)
+@bot.message_handler(commands=["show_platform_off"])
+def _sp_off(m):
+    CFG.show_platform = False
+    bot.reply_to(m, "Показывать платформу: OFF")
 
-async def _main_async():
-    _start_web()
-    threading.Thread(target=_poll, daemon=True).start()
-    await alert_loop()
+@bot.message_handler(commands=["set_region"])
+def _set_region(m):
+    parts = m.text.strip().split()
+    if len(parts) == 2 and parts[1].upper() in ("UA", "DE"):
+        CFG.region = parts[1].upper()
+        bot.reply_to(m, f"Регион: {CFG.region}")
+    else:
+        bot.reply_to(m, "Использование: /set_region UA|DE")
 
+# -----------------------------
+# Main
+# -----------------------------
 if __name__ == "__main__":
-    try:
-        asyncio.run(_main_async())
-    except KeyboardInterrupt:
-        print("Бот остановлен вручную")
+    print("Starting Flask webhook server…")
+    # Flask will serve webhook; scanner thread already started.
+    app.run(host="0.0.0.0", port=PORT)
