@@ -705,7 +705,249 @@ def _cmd_start(m):
         "/debounce 900 — анти-спам (сек)\n"
         "/arb_on|/arb_off, /arb_thresh 3.0 — арбитраж (опционально)\n"
         "/privacy_on|off, /dex_only_on|off, /show_platform_on|off, /set_region UA|DE"
-    ))
+         ))
+  
+# --- PATCH: add three profile commands (/mode aggressive, /mode standard, /mode safe)
+# Paste this block near your existing @bot.message_handler commands in main.py
+# Safe for your current CFG: it checks attributes before setting.
+
+from typing import Any, List
+
+# -------- helpers (non‑breaking setters) --------
+
+def _set(obj: Any, name: str, value: Any) -> bool:
+    if hasattr(obj, name):
+        try:
+            setattr(obj, name, value)
+            return True
+        except Exception:
+            return False
+    return False
+
+
+def _apply_window(cfg: Any, seconds: int):
+    # window for pump/zscore logic
+    _set(cfg, 'window_sec', int(seconds))
+    # compatibility if your build uses minutes
+    _set(cfg, 'lookback_min', max(1, int(round(seconds/60))))
+    # make polling reasonably fast
+    _set(cfg, 'poll_interval_sec', min(30, max(10, seconds//2)))
+
+
+def _apply_strong(cfg: Any, strong_sigma: float, fallback_move: List[float] | None = None):
+    # prefer z-score param if present
+    _set(cfg, 'strong_sigma', float(strong_sigma))
+    if fallback_move:
+        # fallback for engines без z-score: tune move %
+        if len(fallback_move) == 2:
+            _set(cfg, 'move_up_pct', float(fallback_move[0]))
+            _set(cfg, 'move_dn_pct', float(fallback_move[1]))
+
+
+def _apply_tp(cfg: Any, tps: List[float]):
+    # unified list if supported
+    if not _set(cfg, 'tp_pcts', list(tps)):
+        # legacy 3 fields
+        if len(tps) >= 3:
+            _set(cfg, 'tp1_pct', float(tps[0]))
+            _set(cfg, 'tp2_pct', float(tps[1]))
+            _set(cfg, 'tp3_pct', float(tps[2]))
+
+
+def _apply_sl(cfg: Any, sl_pct: float):
+    _set(cfg, 'sl_pct', float(sl_pct))
+
+
+def _apply_ema200(cfg: Any, on: bool):
+    _set(cfg, 'ema200_filter', bool(on))
+    # ensure ema lengths sane
+    _set(cfg, 'ema_fast', getattr(cfg, 'ema_fast', 12))
+    _set(cfg, 'ema_slow', getattr(cfg, 'ema_slow', 26))
+
+
+def _apply_rsi(cfg: Any, period: int):
+    _set(cfg, 'rsi_len', int(period))
+
+
+def _apply_debounce(cfg: Any, seconds: int):
+    _set(cfg, 'debounce_sec', int(seconds))
+
+
+def _enable_providers(names_on: List[str], names_off: List[str]):
+    # expects CFG.providers like {"MEXC": ProviderCfg(...)}
+    try:
+        for nm in names_on:
+            if nm in CFG.providers:
+                CFG.providers[nm].enabled = True
+        for nm in names_off:
+            if nm in CFG.providers:
+                CFG.providers[nm].enabled = False
+    except Exception:
+        pass
+
+
+# -------- modes --------
+
+@bot.message_handler(commands=['mode'])
+def cmd_mode_help(m):
+    parts = m.text.strip().split()
+    if len(parts) == 1:
+        bot.reply_to(m, (
+            "Использование: /mode aggressive | standard | safe\n"
+            "aggressive — максимум сигналов (включая мемы, Solana DEX), короткие SL/TP.\n"
+            "standard — дневной режим по умолчанию, баланс сигналов/качества.\n"
+            "safe — строгие фильтры, меньше сигналов (ночью/занята)."
+        ))
+        return
+
+@bot.message_handler(commands=['mode_aggressive'])
+def mode_aggressive_alias(m):
+    _mode_aggressive(m)
+
+@bot.message_handler(commands=['mode_standard'])
+def mode_standard_alias(m):
+    _mode_standard(m)
+
+@bot.message_handler(commands=['mode_safe'])
+def mode_safe_alias(m):
+    _mode_safe(m)
+
+@bot.message_handler(func=lambda msg: msg.text and msg.text.strip().lower().startswith('/mode '))
+def mode_router(m):
+    arg = m.text.strip().split(maxsplit=1)[1].lower()
+    if arg.startswith('aggr'): _mode_aggressive(m)
+    elif arg.startswith('std') or arg.startswith('stan'): _mode_standard(m)
+    elif arg.startswith('safe'): _mode_safe(m)
+    else: bot.reply_to(m, 'Неизвестный режим. Используй: aggressive | standard | safe')
+
+
+def _mode_aggressive(m):
+    # Assets: top + memes
+    CFG.watch = ['BTC','ETH','SOL','XRP','BNB','DOGE','PEPE','FLOKI','WIF','BONK']
+    # Window/strength
+    _apply_window(CFG, 180)                 # 3m окно
+    _apply_strong(CFG, 1.6, fallback_move=[0.8, 1.0])
+    # Risk model
+    _apply_sl(CFG, 0.3)
+    _apply_tp(CFG, [0.6, 1.2, 2.0])
+    _apply_ema200(CFG, False)
+    _apply_rsi(CFG, 9)
+    _apply_debounce(CFG, 300)
+    # Providers: all (no Binance), allow DEX aggregator if present in your build
+    _enable_providers(['MEXC','KuCoin','Gate.io','DEX','Raydium','Jupiter'], [])
+    # mark mode
+    setattr(CFG, 'active_mode', 'AGGRESSIVE')
+    bot.reply_to(m,
+        "⚡ Режим: AGGRESSIVE\n"
+        "Активы: BTC, ETH, SOL, XRP, BNB + DOGE, PEPE, FLOKI, WIF, BONK\n"
+        "Окно: 3m | Сила ≥1.6σ | SL 0.3% | TP 0.6/1.2/2.0% | EMA200 OFF | RSI 9 | Debounce 300s\n"
+        "Источники: MEXC, KuCoin, Gate.io + Solana DEX (если включён)"
+    )
+
+
+def _mode_standard(m):
+    CFG.watch = ['BTC','ETH','SOL','TON','XRP','BNB','ADA']
+    _apply_window(CFG, 300)                 # 5m
+    _apply_strong(CFG, 2.0, fallback_move=[1.0, 1.2])
+    _apply_sl(CFG, 0.4)
+    _apply_tp(CFG, [0.8, 1.6, 3.0])
+    _apply_ema200(CFG, True)
+    _apply_rsi(CFG, 14)
+    _apply_debounce(CFG, 600)
+    _enable_providers(['MEXC','KuCoin','Gate.io','DEX'], [])
+    setattr(CFG, 'active_mode', 'STANDARD')
+    bot.reply_to(m,
+        "✅ Режим: STANDARD\n"
+        "Активы: BTC, ETH, SOL, TON, XRP, BNB, ADA\n"
+        "Окно: 5m | Сила ≥2.0σ | SL 0.4% | TP 0.8/1.6/3.0% | EMA200 ON | RSI 14 | Debounce 600s\n"
+        "Источники: MEXC, KuCoin, Gate.io (+ DEX агрегатор, если доступен)"
+    )
+
+
+def _mode_safe(m):
+    CFG.watch = ['BTC','ETH','SOL','TON','ADA']
+    _apply_window(CFG, 600)                 # 10m
+    _apply_strong(CFG, 2.6, fallback_move=[1.5, 1.8])
+    _apply_sl(CFG, 0.6)
+    _apply_tp(CFG, [1.5, 3.0, 5.0])
+    _apply_ema200(CFG, True)
+    _apply_rsi(CFG, 14)
+    _apply_debounce(CFG, 1200)
+    _enable_providers(['MEXC','KuCoin'], ['Gate.io'])  # ночью экономим на шуме
+    setattr(CFG, 'active_mode', 'SAFE')
+    bot.reply_to(m,
+        "🛡 Режим: SAFE\n"
+        "Активы: BTC, ETH, SOL, TON, ADA\n"
+        "Окно: 10m | Сила ≥2.6σ | SL 0.6% | TP 1.5/3.0/5.0% | EMA200 ON | RSI 14 | Debounce 1200s\n"
+        "Источники: MEXC, KuCoin (без шумных)"
+    )
+
+
+# (Опционально) строка в /status — показать активный режим.
+try:
+    _old_status = cmd_status  # keep reference
+    @bot.message_handler(commands=['status'])
+    def cmd_status_with_mode(m):
+        # call old handler first
+        try:
+            _old_status(m)
+        except Exception:
+            pass
+        mode = getattr(CFG, 'active_mode', '—')
+        bot.reply_to(m, f"Режим: {mode}")
+except Exception:
+    pass
+
+
+# --- PLAN B (failsafe) — minimal modes if the big patch conflicts ---
+# Paste this *instead* if the main patch errors on deploy. It only sets the
+# core fields and avoids touching providers/status wrappers.
+
+from typing import Any
+
+def _sa(o: Any, n: str, v: Any):
+    try:
+        if hasattr(o, n):
+            setattr(o, n, v)
+    except Exception:
+        pass
+
+def _win(sec: int):
+    _sa(CFG, 'window_sec', int(sec))
+    _sa(CFG, 'lookback_min', max(1, int(round(sec/60))))
+    _sa(CFG, 'poll_interval_sec', min(30, max(10, sec//2)))
+
+def _tp(a,b,c):
+    _sa(CFG, 'tp_pcts', [a,b,c])
+    _sa(CFG, 'tp1_pct', a); _sa(CFG, 'tp2_pct', b); _sa(CFG, 'tp3_pct', c)
+
+@bot.message_handler(commands=['mode_aggressive_b'])
+def mode_aggr_b(m):
+    CFG.watch = ['BTC','ETH','SOL','XRP','BNB','DOGE','PEPE','FLOKI','WIF','BONK']
+    _win(180); _sa(CFG,'strong_sigma',1.6); _sa(CFG,'move_up_pct',0.8); _sa(CFG,'move_dn_pct',1.0)
+    _sa(CFG,'sl_pct',0.3); _tp(0.6,1.2,2.0)
+    _sa(CFG,'ema200_filter',False); _sa(CFG,'rsi_len',9); _sa(CFG,'debounce_sec',300)
+    _sa(CFG,'active_mode','AGGRESSIVE')
+    bot.reply_to(m, '⚡ Режим: AGGRESSIVE (Plan B) включён')
+
+@bot.message_handler(commands=['mode_standard_b'])
+def mode_std_b(m):
+    CFG.watch = ['BTC','ETH','SOL','TON','XRP','BNB','ADA']
+    _win(300); _sa(CFG,'strong_sigma',2.0); _sa(CFG,'move_up_pct',1.0); _sa(CFG,'move_dn_pct',1.2)
+    _sa(CFG,'sl_pct',0.4); _tp(0.8,1.6,3.0)
+    _sa(CFG,'ema200_filter',True); _sa(CFG,'rsi_len',14); _sa(CFG,'debounce_sec',600)
+    _sa(CFG,'active_mode','STANDARD')
+    bot.reply_to(m, '✅ Режим: STANDARD (Plan B) включён')
+
+@bot.message_handler(commands=['mode_safe_b'])
+def mode_safe_b(m):
+    CFG.watch = ['BTC','ETH','SOL','TON','ADA']
+    _win(600); _sa(CFG,'strong_sigma',2.6); _sa(CFG,'move_up_pct',1.5); _sa(CFG,'move_dn_pct',1.8)
+    _sa(CFG,'sl_pct',0.6); _tp(1.5,3.0,5.0)
+    _sa(CFG,'ema200_filter',True); _sa(CFG,'rsi_len',14); _sa(CFG,'debounce_sec',1200)
+    _sa(CFG,'active_mode','SAFE')
+    bot.reply_to(m, '🛡 Режим: SAFE (Plan B) включён')
+
 
 @bot.message_handler(commands=["help"])
 def _cmd_help(m):
@@ -901,6 +1143,7 @@ def _set_region(m):
         bot.reply_to(m, f"Регион: {CFG.region}")
     else:
         bot.reply_to(m, "Использование: /set_region UA|DE")
+      
 
 # -----------------------------
 # Main
