@@ -1148,7 +1148,24 @@ def _set_region(m):
 # -----------------------------
 # Main
 # -----------------------------
+
+import threading, asyncio, time
+
+def _run_scanner_forever():
+    print(">>> [scanner] starting...")
+    while True:
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(alert_loop())  # 🚀 тут твой async-сканер
+            loop.close()
+        except Exception as e:
+            print(f">>> [scanner] crashed: {e}. Restart in 5s...")
+            time.sleep(5)
+
 if __name__ == "__main__":
-    print("Starting Flask webhook server…")
-    # Flask will serve webhook; scanner thread already started.
+    threading.Thread(target=_run_scanner_forever, daemon=True).start()
+    print(">>> [webhook] starting Flask...")
     app.run(host="0.0.0.0", port=PORT)
+
+
