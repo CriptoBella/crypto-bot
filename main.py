@@ -1002,36 +1002,39 @@ def _mode_aggressive(m):
             "Окно 3m | z≥1.6 | SL 0.3% | TP 0.6/1.2/2.0% | EMA200 OFF | RSI 9 | Debounce 300s"
         ),
     )
-# -------- Privacy helpers (DE) --------
+
+# --- Privacy helpers (SAFE minimal) ---
 @bot.message_handler(commands=["stealth_de"])
-@_persist_after
 def _cmd_stealth_de(m):
-    with CFG_LOCK:
+    try:
         CFG.region = "DE"
-        CFG.privacy_mode = True      # скрыть лишнее в алертах
-        CFG.show_platform = False    # не показывать кнопку/название платформы
-    bot.reply_to(
-        m,
-        (
+        CFG.privacy_mode = True
+        CFG.show_platform = False
+        bot.reply_to(
+            m,
             "🔒 Стелс-профиль DE включён.\n"
             "Напоминания:\n"
-            "• VPN с split tunneling: биржи/бот через VPN; банк/KYC — вне VPN.\n"
+            "• VPN split tunneling: биржи/бот через VPN; банк/KYC — вне VPN.\n"
             "• Раздельные кошельки и 2FA; белый список адресов на выводах CEX.\n"
             "• В боте: /status → Privacy ON, Show platform OFF, Region DE.\n"
             "• Веди логи сделок для налоговой отчётности. Я не помогаю обходить законы."
-        ),
-    )
+        )
+    except Exception as e:
+        bot.reply_to(m, f"Ошибка: {e}")
 
 @bot.message_handler(commands=["privacy_check"])
 def _cmd_privacy_check(m):
-    rows = []
-    with CFG_LOCK:
-        rows.append(f"Privacy: {'ON' if CFG.privacy_mode else 'OFF'}")
-        rows.append(f"Show platform: {'ON' if CFG.show_platform else 'OFF'}")
-        rows.append(f"DEX-only: {'ON' if CFG.dex_only else 'OFF'}")
-        rows.append(f"Region: {CFG.region}")
-    rows.append("Памятка: соблюдай законы Германии и налоговые правила.")
-    bot.reply_to(m, "🔍 Проверка приватности:\n" + "\n".join("• " + x for x in rows))
+    try:
+        rows = [
+            f"Privacy: {'ON' if CFG.privacy_mode else 'OFF'}",
+            f"Show platform: {'ON' if CFG.show_platform else 'OFF'}",
+            f"DEX-only: {'ON' if CFG.dex_only else 'OFF'}",
+            f"Region: {CFG.region}",
+        ]
+        rows.append("Памятка: соблюдай законы Германии и налоговые правила.")
+        bot.reply_to(m, "🔍 Проверка приватности:\n" + "\n".join("• " + x for x in rows))
+    except Exception as e:
+        bot.reply_to(m, f"Ошибка: {e}")
 
 
 @_persist_after
