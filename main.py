@@ -1172,6 +1172,25 @@ def _cmd_privacy_tips(m):
             "• Раздельные кошельки/браузерные профили для DEX и CEX."
         ),
     )
+@bot.message_handler(commands=["selftest"])
+def _cmd_selftest(m):
+    # Шлём тестовый сигнал, чтобы проверить доставку
+    text, kb = build_trade_message(
+        symbol="BTC",
+        direction="LONG",
+        price=50000.0,
+        sl_price=49500.0,
+        tp_prices=[50500.0, 51000.0, 52000.0],
+        reason="SELFTEST",
+        move_pct=0.5,
+        rsi=55.0,
+        vol_hint="demo",
+    )
+    safe_send("✅ SELFTEST: проверка доставки\n" + text, kb)
+    try:
+        bot.reply_to(m, "SELFTEST отправлен. Если в чат не пришло — проверь вебхук и CHAT_ID.")
+    except Exception:
+        pass
 
 
 # -----------------------------
